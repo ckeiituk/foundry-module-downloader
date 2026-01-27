@@ -145,7 +145,27 @@ def filename_from_cd(content_disposition: Optional[str]) -> Optional[str]:
     return None
 
 
-def download_google_drive(url: str, dest_dir: Path) -> List[Path]:
+def save_debug_html(html: str, debug_dir: Optional[Path], stem: str) -> Optional[Path]:
+    if debug_dir is None:
+        return None
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    safe_stem = re.sub(r"[^a-zA-Z0-9_-]+", "_", stem).strip("_") or "gdrive"
+    debug_path = debug_dir / f"{safe_stem}.html"
+    debug_path.write_text(html, encoding="utf-8", errors="replace")
+    return debug_path
+
+
+def extract_html_title(html: str) -> Optional[str]:
+    match = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    title = re.sub(r"\\s+", " ", match.group(1)).strip()
+    return title or None
+
+
+def download_google_drive(
+    url: str, dest_dir: Path, debug_dir: Optional[Path]
+) -> List[Path]:
     ensure_module("requests", "requests")
     import requests  # type: ignore
 
@@ -184,13 +204,19 @@ def download_google_drive(url: str, dest_dir: Path) -> List[Path]:
     response.raise_for_status()
     content_type = response.headers.get("content-type", "")
     if "text/html" in content_type and not response.headers.get("content-disposition"):
-        if "accounts.google.com" in response.text or "ServiceLogin" in response.text:
+        html = response.text
+        title = extract_html_title(html)
+        debug_path = save_debug_html(html, debug_dir, f"gdrive_{file_id}")
+        if "accounts.google.com" in html or "ServiceLogin" in html:
             raise RuntimeError(
                 "Google Drive требует авторизацию. Сделайте файл публичным "
                 "(Anyone with the link) и попробуйте снова."
             )
+        hint = f" (страница: {title})" if title else ""
+        debug_hint = f" HTML сохранен в {debug_path}" if debug_path else ""
         raise RuntimeError(
-            "Google Drive returned HTML instead of a file. Check sharing permissions."
+            "Google Drive returned HTML instead of a file. "
+            f"Check sharing permissions.{hint}{debug_hint}"
         )
     filename = filename_from_cd(response.headers.get("content-disposition"))
     if not filename:
@@ -327,9 +353,11 @@ def process_downloads(
     return moved
 
 
-def download_url(url: str, dest_dir: Path) -> List[Path]:
+def download_url(
+    url: str, dest_dir: Path, debug_dir: Optional[Path]
+) -> List[Path]:
     if is_google_drive(url):
-        return download_google_drive(url, dest_dir)
+        return download_google_drive(url, dest_dir, debug_dir)
     if is_mega(url):
         return download_mega(url, dest_dir)
     raise RuntimeError(f"Unsupported URL: {url}")
@@ -349,6 +377,11 @@ def main() -> int:
         help=f"Foundry modules directory (default: {DEFAULT_MODULES_DIR})",
     )
     parser.add_argument(
+        "--debug-html",
+        default="",
+        help="Directory to save HTML responses from Google Drive on error",
+    )
+    parser.add_argument(
         "--owner",
         default=DEFAULT_OWNER,
         help=f"Owner to apply after extraction (default: {DEFAULT_OWNER})",
@@ -363,11 +396,12 @@ def main() -> int:
     modules_dir = Path(args.modules_dir)
     modules_dir.mkdir(parents=True, exist_ok=True)
 
+    debug_dir = Path(args.debug_html).expanduser() if args.debug_html else None
     all_moved: List[Path] = []
     for url in args.url:
         with tempfile.TemporaryDirectory(prefix="foundry_download_") as tmp_dir:
             tmp_path = Path(tmp_dir)
-            downloaded = download_url(url, tmp_path)
+            downloaded = download_url(url, tmp_path, debug_dir)
             moved = process_downloads(downloaded, modules_dir, args.force)
             all_moved.extend(moved)
 
