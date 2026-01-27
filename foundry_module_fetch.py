@@ -28,8 +28,10 @@ ARCHIVE_TAR_EXTS = (
 ARCHIVE_7Z_EXTS = (".7z", ".rar")
 
 
-def run(cmd: List[str]) -> None:
-    subprocess.run(cmd, check=True)
+def run(cmd: List[str], ok_codes: Iterable[int] = (0,)) -> None:
+    result = subprocess.run(cmd)
+    if result.returncode not in ok_codes:
+        raise subprocess.CalledProcessError(result.returncode, cmd)
 
 
 def ensure_module(module_name: str, pip_name: str) -> None:
@@ -322,13 +324,20 @@ def extract_archive(archive_path: Path, dest_dir: Path) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
     kind = detect_archive(archive_path)
     if kind == "zip":
-        run(["unzip", "-q", "-o", str(archive_path), "-d", str(dest_dir)])
+        # unzip returns 1 for warnings (e.g., filename encoding). Treat as success if files extracted.
+        try:
+            run(["unzip", "-q", "-o", str(archive_path), "-d", str(dest_dir)], ok_codes=(0, 1))
+        except subprocess.CalledProcessError:
+            # Fallback to 7z if unzip fails hard.
+            run(["7z", "x", "-y", f"-o{dest_dir}", str(archive_path)])
     elif kind == "tar":
         run(["tar", "-xf", str(archive_path), "-C", str(dest_dir)])
     elif kind == "7z":
         run(["7z", "x", "-y", f"-o{dest_dir}", str(archive_path)])
     else:
         raise RuntimeError(f"Unsupported archive type: {archive_path}")
+    if not any(dest_dir.iterdir()):
+        raise RuntimeError(f"Archive extraction produced no files: {archive_path}")
 
 
 def move_or_merge(src: Path, dest_root: Path, force: bool) -> Path:
