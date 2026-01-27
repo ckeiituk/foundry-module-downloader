@@ -77,6 +77,11 @@ def is_mega(url: str) -> bool:
     return host.endswith("mega.nz") or host.endswith("mega.co.nz")
 
 
+def is_dropbox(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return host.endswith("dropbox.com") or host.endswith("dropboxusercontent.com")
+
+
 def normalize_mega_url(url: str) -> str:
     if not is_mega(url):
         return url
@@ -96,6 +101,20 @@ def normalize_mega_url(url: str) -> str:
             return f"{base}/#F!{node_id}!{fragment}"
 
     return url
+
+
+def normalize_dropbox_url(url: str) -> str:
+    if not is_dropbox(url):
+        return url
+
+    parsed = urlparse(url)
+    if parsed.netloc.lower().endswith("dropboxusercontent.com"):
+        return url
+
+    params = parse_qs(parsed.query)
+    params["dl"] = ["1"]
+    query = "&".join(f"{key}={value[0]}" for key, value in params.items())
+    return parsed._replace(query=query).geturl()
 
 
 def extract_gdrive_file_id(url: str) -> Optional[str]:
@@ -275,6 +294,41 @@ def download_google_drive(
     return [target]
 
 
+def filename_from_url(url: str) -> Optional[str]:
+    parsed = urlparse(url)
+    name = Path(parsed.path).name
+    return unquote(name) if name else None
+
+
+def download_dropbox(url: str, dest_dir: Path) -> List[Path]:
+    ensure_module("requests", "requests")
+    import requests  # type: ignore
+
+    download_url = normalize_dropbox_url(url)
+    response = requests.get(download_url, stream=True, allow_redirects=True)
+    response.raise_for_status()
+
+    content_type = response.headers.get("content-type", "")
+    if "text/html" in content_type and not response.headers.get("content-disposition"):
+        raise RuntimeError(
+            "Dropbox returned HTML instead of a file. Check sharing permissions."
+        )
+
+    filename = filename_from_cd(response.headers.get("content-disposition"))
+    if not filename:
+        filename = filename_from_url(response.url) or filename_from_url(download_url)
+    if not filename:
+        raise RuntimeError("Could not determine Dropbox filename.")
+
+    filename = Path(filename).name
+    target = dest_dir / filename
+    with target.open("wb") as handle:
+        for chunk in response.iter_content(chunk_size=1024 * 256):
+            if chunk:
+                handle.write(chunk)
+    return [target]
+
+
 def download_mega(url: str, dest_dir: Path) -> List[Path]:
     mega_url = normalize_mega_url(url)
 
@@ -414,6 +468,8 @@ def download_url(
 ) -> List[Path]:
     if is_google_drive(url):
         return download_google_drive(url, dest_dir, debug_dir)
+    if is_dropbox(url):
+        return download_dropbox(url, dest_dir)
     if is_mega(url):
         return download_mega(url, dest_dir)
     raise RuntimeError(f"Unsupported URL: {url}")
