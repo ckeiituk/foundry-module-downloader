@@ -82,9 +82,9 @@ def is_dropbox(url: str) -> bool:
     return host.endswith("dropbox.com") or host.endswith("dropboxusercontent.com")
 
 
-def normalize_mega_url(url: str) -> str:
+def parse_mega_link(url: str) -> Optional[dict]:
     if not is_mega(url):
-        return url
+        return None
 
     parsed = urlparse(url)
     parts = [part for part in parsed.path.split("/") if part]
@@ -92,15 +92,83 @@ def normalize_mega_url(url: str) -> str:
     scheme = parsed.scheme or "https"
     base = f"{scheme}://{parsed.netloc}"
 
-    if len(parts) >= 2 and fragment:
-        node_type = parts[0].lower()
-        node_id = parts[1]
-        if node_type == "file":
-            return f"{base}/#!{node_id}!{fragment}"
-        if node_type == "folder" and len(parts) == 2:
-            return f"{base}/#F!{node_id}!{fragment}"
+    if len(parts) >= 2 and parts[0].lower() == "file":
+        return {
+            "kind": "file",
+            "file_id": parts[1],
+            "key": fragment,
+            "base": base,
+        }
 
-    return url
+    if len(parts) >= 2 and parts[0].lower() == "folder":
+        folder_id = parts[1]
+        if "/file/" in fragment:
+            key, _, file_id = fragment.partition("/file/")
+            return {
+                "kind": "folder_file",
+                "folder_id": folder_id,
+                "file_id": file_id,
+                "key": key,
+                "base": base,
+            }
+        return {
+            "kind": "folder",
+            "folder_id": folder_id,
+            "key": fragment,
+            "base": base,
+        }
+
+    if fragment.startswith("F!"):
+        tokens = fragment.split("!")
+        if len(tokens) >= 3:
+            info = {
+                "kind": "folder",
+                "folder_id": tokens[1],
+                "key": tokens[2],
+                "base": base,
+            }
+            if len(tokens) >= 4 and tokens[3]:
+                info["kind"] = "folder_file"
+                info["file_id"] = tokens[3]
+            return info
+
+    if fragment.startswith("!"):
+        tokens = fragment.split("!")
+        if len(tokens) >= 3:
+            return {
+                "kind": "file",
+                "file_id": tokens[1],
+                "key": tokens[2],
+                "base": base,
+            }
+
+    return None
+
+
+def mega_url_for_megatools(url: str) -> tuple[str, bool]:
+    info = parse_mega_link(url)
+    if not info:
+        return url, False
+
+    base = info["base"]
+    kind = info["kind"]
+    if kind == "file":
+        file_id = info.get("file_id", "")
+        key = info.get("key", "")
+        if file_id and key:
+            return f"{base}/#!{file_id}!{key}", False
+    if kind == "folder":
+        folder_id = info.get("folder_id", "")
+        key = info.get("key", "")
+        if folder_id and key:
+            return f"{base}/#F!{folder_id}!{key}", False
+    if kind == "folder_file":
+        folder_id = info.get("folder_id", "")
+        key = info.get("key", "")
+        if folder_id and key:
+            return f"{base}/#F!{folder_id}!{key}", True
+
+    return url, False
 
 
 def normalize_dropbox_url(url: str) -> str:
@@ -330,16 +398,21 @@ def download_dropbox(url: str, dest_dir: Path) -> List[Path]:
 
 
 def download_mega(url: str, dest_dir: Path) -> List[Path]:
-    mega_url = normalize_mega_url(url)
-
     if shutil.which("mega-get"):
-        run(["mega-get", mega_url, str(dest_dir)])
+        run(["mega-get", url, str(dest_dir)])
         items = list(dest_dir.iterdir())
         if not items:
             raise RuntimeError("Mega download did not create any files.")
         return items
 
     if shutil.which("megadl"):
+        mega_url, folder_fallback = mega_url_for_megatools(url)
+        if folder_fallback:
+            print(
+                "Warning: Mega folder/file link detected; megatools will "
+                "download the entire folder.",
+                file=sys.stderr,
+            )
         run(["megadl", "--path", str(dest_dir), mega_url])
         items = list(dest_dir.iterdir())
         if not items:
