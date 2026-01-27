@@ -526,7 +526,10 @@ def chown_paths(paths: Iterable[Path], owner: str) -> None:
 
 
 def process_downloads(
-    downloaded: List[Path], modules_dir: Path, force: bool
+    downloaded: List[Path],
+    modules_dir: Path,
+    force: bool,
+    work_dir: Optional[Path],
 ) -> List[Path]:
     moved: List[Path] = []
     for item in downloaded:
@@ -536,7 +539,10 @@ def process_downloads(
 
         kind = detect_archive(item)
         if kind:
-            with tempfile.TemporaryDirectory(prefix="foundry_extract_") as extract_tmp:
+            with tempfile.TemporaryDirectory(
+                prefix="foundry_extract_",
+                dir=str(work_dir) if work_dir else None,
+            ) as extract_tmp:
                 extract_dir = Path(extract_tmp)
                 extract_archive(item, extract_dir)
                 extracted_items = list(extract_dir.iterdir())
@@ -590,18 +596,33 @@ def main() -> int:
         action="store_true",
         help="Overwrite existing module files if name conflicts",
     )
+    parser.add_argument(
+        "--work-dir",
+        default="",
+        help=(
+            "Directory for temporary downloads/extraction (default: system tmp). "
+            "Useful if /tmp is small (tmpfs)."
+        ),
+    )
 
     args = parser.parse_args()
     modules_dir = Path(args.modules_dir)
     modules_dir.mkdir(parents=True, exist_ok=True)
 
     debug_dir = Path(args.debug_html).expanduser() if args.debug_html else None
+    work_dir = Path(args.work_dir).expanduser() if args.work_dir else None
+    if work_dir:
+        work_dir.mkdir(parents=True, exist_ok=True)
+
     all_moved: List[Path] = []
     for url in args.url:
-        with tempfile.TemporaryDirectory(prefix="foundry_download_") as tmp_dir:
+        with tempfile.TemporaryDirectory(
+            prefix="foundry_download_",
+            dir=str(work_dir) if work_dir else None,
+        ) as tmp_dir:
             tmp_path = Path(tmp_dir)
             downloaded = download_url(url, tmp_path, debug_dir)
-            moved = process_downloads(downloaded, modules_dir, args.force)
+            moved = process_downloads(downloaded, modules_dir, args.force, work_dir)
             all_moved.extend(moved)
 
     if all_moved:
