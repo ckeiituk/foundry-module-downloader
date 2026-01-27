@@ -28,8 +28,13 @@ ARCHIVE_TAR_EXTS = (
 ARCHIVE_7Z_EXTS = (".7z", ".rar")
 
 
-def run(cmd: List[str], ok_codes: Iterable[int] = (0,)) -> None:
-    result = subprocess.run(cmd)
+def run(
+    cmd: List[str],
+    ok_codes: Iterable[int] = (0,),
+    stdout: Optional[int] = None,
+    stderr: Optional[int] = None,
+) -> None:
+    result = subprocess.run(cmd, stdout=stdout, stderr=stderr)
     if result.returncode not in ok_codes:
         raise subprocess.CalledProcessError(result.returncode, cmd)
 
@@ -326,7 +331,12 @@ def extract_archive(archive_path: Path, dest_dir: Path) -> None:
     if kind == "zip":
         # unzip returns 1 for warnings (e.g., filename encoding). Treat as success if files extracted.
         try:
-            run(["unzip", "-q", "-o", str(archive_path), "-d", str(dest_dir)], ok_codes=(0, 1))
+            run(
+                ["unzip", "-qq", "-o", str(archive_path), "-d", str(dest_dir)],
+                ok_codes=(0, 1),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         except subprocess.CalledProcessError:
             # Fallback to 7z if unzip fails hard.
             run(["7z", "x", "-y", f"-o{dest_dir}", str(archive_path)])
