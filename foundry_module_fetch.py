@@ -8,6 +8,7 @@ import site
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
 from urllib.parse import parse_qs, unquote, urlparse
@@ -26,6 +27,41 @@ ARCHIVE_TAR_EXTS = (
     ".txz",
 )
 ARCHIVE_7Z_EXTS = (".7z", ".rar")
+TELEGRAM_HOSTS = ("t.me", "telegram.me", "telegram.dog")
+
+
+@dataclass(frozen=True)
+class TelegramConfig:
+    api_id: int
+    api_hash: str
+    session: str
+
+
+def load_dotenv(path: Path, override: bool = False) -> bool:
+    if not path.is_file():
+        return False
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if (value.startswith('"') and value.endswith('"')) or (
+            value.startswith("'") and value.endswith("'")
+        ):
+            value = value[1:-1]
+        if override or key not in os.environ:
+            os.environ[key] = value
+
+    return True
 
 
 def run(
@@ -80,6 +116,66 @@ def is_mega(url: str) -> bool:
 def is_dropbox(url: str) -> bool:
     host = urlparse(url).netloc.lower()
     return host.endswith("dropbox.com") or host.endswith("dropboxusercontent.com")
+
+
+def normalize_telegram_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme and parsed.netloc:
+        return url
+
+    path = parsed.path.lstrip("/")
+    for host in TELEGRAM_HOSTS:
+        if path.startswith(f"{host}/"):
+            return f"https://{path}"
+    return url
+
+
+def is_telegram(url: str) -> bool:
+    normalized = normalize_telegram_url(url)
+    host = urlparse(normalized).netloc.lower()
+    if host in TELEGRAM_HOSTS:
+        return True
+    return any(host.endswith(f".{candidate}") for candidate in TELEGRAM_HOSTS)
+
+
+def parse_telegram_message_url(url: str) -> Optional[dict]:
+    normalized = normalize_telegram_url(url)
+    parsed = urlparse(normalized)
+    host = parsed.netloc.lower()
+    if host not in TELEGRAM_HOSTS and not any(
+        host.endswith(f".{candidate}") for candidate in TELEGRAM_HOSTS
+    ):
+        return None
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts:
+        return None
+
+    if parts[0] == "s":
+        if len(parts) < 3:
+            return None
+        username = parts[1]
+        msg_id = parts[-1]
+        if not msg_id.isdigit():
+            return None
+        return {"peer": username, "msg_id": int(msg_id)}
+
+    if parts[0] == "c":
+        if len(parts) < 3:
+            return None
+        chat_id = parts[1]
+        msg_id = parts[-1]
+        if not chat_id.isdigit() or not msg_id.isdigit():
+            return None
+        return {"peer": int(f"-100{chat_id}"), "msg_id": int(msg_id)}
+
+    if len(parts) < 2:
+        return None
+    username = parts[0]
+    msg_id = parts[-1]
+    if not msg_id.isdigit():
+        return None
+    return {"peer": username, "msg_id": int(msg_id)}
 
 
 def parse_mega_link(url: str) -> Optional[dict]:
@@ -455,6 +551,38 @@ def download_mega(url: str, dest_dir: Path) -> List[Path]:
     return items
 
 
+def download_telegram(
+    url: str, dest_dir: Path, config: TelegramConfig
+) -> List[Path]:
+    ensure_module("telethon", "telethon")
+    from telethon.sync import TelegramClient  # type: ignore
+
+    info = parse_telegram_message_url(url)
+    if not info:
+        raise RuntimeError(f"Unsupported Telegram message URL: {url}")
+
+    with TelegramClient(config.session, config.api_id, config.api_hash) as client:
+        client.start()
+        message = client.get_messages(info["peer"], ids=info["msg_id"])
+        if not message:
+            raise RuntimeError("Telegram message not found or inaccessible.")
+        if not message.media:
+            raise RuntimeError("Telegram message has no media to download.")
+        result = client.download_media(message, file=str(dest_dir))
+
+    if not result:
+        raise RuntimeError("Telegram download produced no files.")
+
+    if isinstance(result, list):
+        paths = [Path(item) for item in result if item]
+    else:
+        paths = [Path(result)]
+
+    if not paths:
+        raise RuntimeError("Telegram download produced no files.")
+    return paths
+
+
 def detect_archive(path: Path) -> Optional[str]:
     name = path.name.lower()
     if name.endswith(".zip"):
@@ -557,7 +685,10 @@ def process_downloads(
 
 
 def download_url(
-    url: str, dest_dir: Path, debug_dir: Optional[Path]
+    url: str,
+    dest_dir: Path,
+    debug_dir: Optional[Path],
+    telegram: Optional[TelegramConfig],
 ) -> List[Path]:
     if is_google_drive(url):
         return download_google_drive(url, dest_dir, debug_dir)
@@ -565,17 +696,75 @@ def download_url(
         return download_dropbox(url, dest_dir)
     if is_mega(url):
         return download_mega(url, dest_dir)
+    if is_telegram(url):
+        if telegram is None:
+            raise RuntimeError(
+                "Telegram URL detected but API credentials are missing. "
+                "Provide --tg-api-id and --tg-api-hash (or TG_API_ID/TG_API_HASH)."
+            )
+        return download_telegram(url, dest_dir, telegram)
     raise RuntimeError(f"Unsupported URL: {url}")
 
 
+def parse_telegram_config(args: argparse.Namespace) -> Optional[TelegramConfig]:
+    api_id = (
+        args.tg_api_id
+        if args.tg_api_id is not None
+        else os.environ.get("TG_API_ID", "")
+    )
+    api_hash = (
+        args.tg_api_hash
+        if args.tg_api_hash is not None
+        else os.environ.get("TG_API_HASH", "")
+    )
+    session = (
+        args.tg_session
+        if args.tg_session is not None
+        else os.environ.get("TG_SESSION", "telegram.session")
+    )
+
+    if not api_id and not api_hash:
+        return None
+    if not api_id or not api_hash:
+        raise RuntimeError(
+            "Telegram credentials are incomplete. Provide both --tg-api-id "
+            "and --tg-api-hash (or set TG_API_ID and TG_API_HASH)."
+        )
+    try:
+        api_id_value = int(api_id)
+    except ValueError as exc:
+        raise RuntimeError("Telegram --tg-api-id must be a number.") from exc
+
+    return TelegramConfig(api_id=api_id_value, api_hash=api_hash, session=session)
+
+
 def main() -> int:
+    env_parser = argparse.ArgumentParser(add_help=False)
+    env_parser.add_argument(
+        "--env-file",
+        default=".env",
+        help="Path to a .env file with TG_API_ID/TG_API_HASH/TG_SESSION.",
+    )
+    env_parser.add_argument(
+        "--no-env",
+        action="store_true",
+        help="Disable loading the .env file.",
+    )
+    env_args, _ = env_parser.parse_known_args()
+    if not env_args.no_env:
+        load_dotenv(Path(env_args.env_file).expanduser())
+
     parser = argparse.ArgumentParser(
         description=(
-            "Download Foundry modules from Google Drive or Mega links, extract archives, "
-            "and set ownership."
+            "Download Foundry modules from Google Drive, Dropbox, Mega, or Telegram "
+            "links, extract archives, and set ownership."
         )
     )
-    parser.add_argument("url", nargs="+", help="Google Drive or Mega URL")
+    parser.add_argument(
+        "url",
+        nargs="+",
+        help="Google Drive, Dropbox, Mega, or Telegram message URL",
+    )
     parser.add_argument(
         "--modules-dir",
         default=str(DEFAULT_MODULES_DIR),
@@ -604,6 +793,34 @@ def main() -> int:
             "Useful if /tmp is small (tmpfs)."
         ),
     )
+    parser.add_argument(
+        "--tg-api-id",
+        default=None,
+        help="Telegram API ID (or set TG_API_ID). Required for Telegram URLs.",
+    )
+    parser.add_argument(
+        "--tg-api-hash",
+        default=None,
+        help="Telegram API hash (or set TG_API_HASH). Required for Telegram URLs.",
+    )
+    parser.add_argument(
+        "--tg-session",
+        default=None,
+        help=(
+            "Telegram session file path (default: telegram.session or TG_SESSION). "
+            "Created on first login and reused."
+        ),
+    )
+    parser.add_argument(
+        "--env-file",
+        default=".env",
+        help="Path to a .env file with TG_API_ID/TG_API_HASH/TG_SESSION.",
+    )
+    parser.add_argument(
+        "--no-env",
+        action="store_true",
+        help="Disable loading the .env file.",
+    )
 
     args = parser.parse_args()
     modules_dir = Path(args.modules_dir)
@@ -614,6 +831,8 @@ def main() -> int:
     if work_dir:
         work_dir.mkdir(parents=True, exist_ok=True)
 
+    telegram = parse_telegram_config(args)
+
     all_moved: List[Path] = []
     for url in args.url:
         with tempfile.TemporaryDirectory(
@@ -621,7 +840,7 @@ def main() -> int:
             dir=str(work_dir) if work_dir else None,
         ) as tmp_dir:
             tmp_path = Path(tmp_dir)
-            downloaded = download_url(url, tmp_path, debug_dir)
+            downloaded = download_url(url, tmp_path, debug_dir, telegram)
             moved = process_downloads(downloaded, modules_dir, args.force, work_dir)
             all_moved.extend(moved)
 
