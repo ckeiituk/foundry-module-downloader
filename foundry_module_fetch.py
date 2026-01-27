@@ -107,9 +107,29 @@ def extract_gdrive_file_id(url: str) -> Optional[str]:
 
 
 def get_confirm_token_from_html(html: str) -> Optional[str]:
-    match = re.search(r"confirm=([0-9A-Za-z_]+)&", html)
+    patterns = [
+        r"confirm=([0-9A-Za-z_-]+)",
+        r'name="confirm"\s+value="([^"]+)"',
+        r"'confirm'\s*:\s*'([^']+)'",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html)
+        if match:
+            return match.group(1)
+    return None
+
+
+def extract_download_url_from_html(html: str) -> Optional[str]:
+    match = re.search(r'"downloadUrl"\s*:\s*"([^"]+)"', html)
     if match:
-        return match.group(1)
+        url = match.group(1)
+        url = url.replace("\\u003d", "=").replace("\\u0026", "&").replace("\\/", "/")
+        return url
+
+    match = re.search(r'href="(/uc\?export=download[^"]+)"', html)
+    if match:
+        return "https://drive.google.com" + match.group(1).replace("&amp;", "&")
+
     return None
 
 
@@ -147,8 +167,13 @@ def download_google_drive(url: str, dest_dir: Path) -> List[Path]:
         content_type = response.headers.get("content-type", "")
         if "text/html" in content_type:
             html = response.text
+            download_url = extract_download_url_from_html(html)
             token = get_confirm_token_from_html(html)
             response.close()
+            if download_url:
+                response = session.get(download_url, stream=True)
+                response.raise_for_status()
+                token = None
 
     if token:
         response.close()
@@ -159,6 +184,11 @@ def download_google_drive(url: str, dest_dir: Path) -> List[Path]:
     response.raise_for_status()
     content_type = response.headers.get("content-type", "")
     if "text/html" in content_type and not response.headers.get("content-disposition"):
+        if "accounts.google.com" in response.text or "ServiceLogin" in response.text:
+            raise RuntimeError(
+                "Google Drive требует авторизацию. Сделайте файл публичным "
+                "(Anyone with the link) и попробуйте снова."
+            )
         raise RuntimeError(
             "Google Drive returned HTML instead of a file. Check sharing permissions."
         )
