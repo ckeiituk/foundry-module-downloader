@@ -133,9 +133,16 @@ def extract_download_url_from_html(html: str) -> Optional[str]:
     return None
 
 
+def extract_gdrive_form_action(html: str) -> Optional[str]:
+    match = re.search(r'<form[^>]+id="download-form"[^>]+action="([^"]+)"', html)
+    if match:
+        return match.group(1).replace("&amp;", "&")
+    return None
+
+
 def extract_gdrive_form_params(html: str) -> dict:
     params: dict = {}
-    for name in ("confirm", "uuid", "id"):
+    for name in ("confirm", "uuid", "id", "export"):
         match = re.search(rf'name="{name}"\s+value="([^"]+)"', html)
         if match:
             params[name] = match.group(1)
@@ -208,6 +215,7 @@ def download_google_drive(
             html = response.text
             download_url = extract_download_url_from_html(html)
             token = get_confirm_token_from_html(html)
+            form_action = extract_gdrive_form_action(html)
             form_params = extract_gdrive_form_params(html)
             action_params = extract_gdrive_action_params(html)
             response.close()
@@ -219,7 +227,8 @@ def download_google_drive(
                 merged = {"id": file_id}
                 merged.update(action_params)
                 merged.update(form_params)
-                response = session.get(base_url, params=merged, stream=True)
+                target_url = form_action or base_url
+                response = session.get(target_url, params=merged, stream=True)
                 response.raise_for_status()
                 token = None
 
