@@ -406,14 +406,28 @@ def download_mega(url: str, dest_dir: Path) -> List[Path]:
         return items
 
     if shutil.which("megadl"):
-        mega_url, folder_fallback = mega_url_for_megatools(url)
-        if folder_fallback:
-            print(
-                "Warning: Mega folder/file link detected; megatools will "
-                "download the entire folder.",
-                file=sys.stderr,
-            )
-        run(["megadl", "--path", str(dest_dir), mega_url])
+        info = parse_mega_link(url)
+        if info and info.get("kind") == "folder_file":
+            try:
+                run(["megadl", "--path", str(dest_dir), url])
+            except subprocess.CalledProcessError:
+                mega_url, folder_fallback = mega_url_for_megatools(url)
+                if folder_fallback:
+                    print(
+                        "Warning: Mega folder/file link detected; megatools will "
+                        "download the entire folder.",
+                        file=sys.stderr,
+                    )
+                run(["megadl", "--path", str(dest_dir), mega_url])
+        else:
+            mega_url, folder_fallback = mega_url_for_megatools(url)
+            if folder_fallback:
+                print(
+                    "Warning: Mega folder/file link detected; megatools will "
+                    "download the entire folder.",
+                    file=sys.stderr,
+                )
+            run(["megadl", "--path", str(dest_dir), mega_url])
         items = list(dest_dir.iterdir())
         if not items:
             raise RuntimeError("Mega download did not create any files.")
