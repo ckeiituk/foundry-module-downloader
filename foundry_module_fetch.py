@@ -444,6 +444,10 @@ def main() -> int:
 
     if all_moved:
         chown_paths(all_moved, args.owner)
+        for path in all_moved:
+            print(f"Installed: {path}")
+    else:
+        print("Nothing installed.")
 
     return 0
 
