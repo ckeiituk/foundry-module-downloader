@@ -735,7 +735,19 @@ def parse_telegram_config(args: argparse.Namespace) -> Optional[TelegramConfig]:
     except ValueError as exc:
         raise RuntimeError("Telegram --tg-api-id must be a number.") from exc
 
-    return TelegramConfig(api_id=api_id_value, api_hash=api_hash, session=session)
+    session_path = Path(session).expanduser()
+    try:
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"Cannot create Telegram session directory: {session_path.parent}"
+        ) from exc
+
+    return TelegramConfig(
+        api_id=api_id_value,
+        api_hash=api_hash,
+        session=str(session_path),
+    )
 
 
 def main() -> int:
