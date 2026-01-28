@@ -754,7 +754,7 @@ def main() -> int:
     env_parser = argparse.ArgumentParser(add_help=False)
     env_parser.add_argument(
         "--env-file",
-        default=".env",
+        default=None,
         help="Path to a .env file with TG_API_ID/TG_API_HASH/TG_SESSION.",
     )
     env_parser.add_argument(
@@ -764,7 +764,17 @@ def main() -> int:
     )
     env_args, _ = env_parser.parse_known_args()
     if not env_args.no_env:
-        load_dotenv(Path(env_args.env_file).expanduser())
+        if env_args.env_file:
+            load_dotenv(Path(env_args.env_file).expanduser())
+        else:
+            candidate_paths = [
+                Path.cwd() / ".env",
+                Path(__file__).resolve().parent / ".env",
+                Path.home() / ".config" / "foundry-module-downloader" / ".env",
+            ]
+            for candidate in candidate_paths:
+                if load_dotenv(candidate):
+                    break
 
     parser = argparse.ArgumentParser(
         description=(
@@ -825,8 +835,12 @@ def main() -> int:
     )
     parser.add_argument(
         "--env-file",
-        default=".env",
-        help="Path to a .env file with TG_API_ID/TG_API_HASH/TG_SESSION.",
+        default=None,
+        help=(
+            "Path to a .env file with TG_API_ID/TG_API_HASH/TG_SESSION. "
+            "If omitted, looks in CWD, script directory, then "
+            "~/.config/foundry-module-downloader/.env."
+        ),
     )
     parser.add_argument(
         "--no-env",
