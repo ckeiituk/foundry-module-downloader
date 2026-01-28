@@ -10,7 +10,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
 DEFAULT_MODULES_DIR = Path("/opt/foundry/data/Data/modules")
@@ -101,6 +101,16 @@ def ensure_module(module_name: str, pip_name: str) -> None:
     if importlib.util.find_spec(module_name) is None:
         joined = " | ".join(" ".join(c) for c in tried)
         raise RuntimeError(f"Failed to install Python module '{module_name}'. Tried: {joined}")
+
+
+def get_tqdm() -> Optional[Callable[..., object]]:
+    try:
+        ensure_module("tqdm", "tqdm")
+        from tqdm import tqdm  # type: ignore
+    except Exception as exc:
+        print(f"Warning: tqdm unavailable ({exc}). Progress disabled.", file=sys.stderr)
+        return None
+    return tqdm
 
 
 def is_google_drive(url: str) -> bool:
@@ -361,6 +371,41 @@ def filename_from_cd(content_disposition: Optional[str]) -> Optional[str]:
     return None
 
 
+def write_stream_to_file(
+    response,
+    target: Path,
+    desc: str,
+    progress: bool,
+) -> None:
+    total = None
+    content_length = response.headers.get("content-length")
+    if content_length:
+        try:
+            total_value = int(content_length)
+        except ValueError:
+            total_value = 0
+        total = total_value or None
+
+    tqdm = get_tqdm() if progress else None
+    with target.open("wb") as handle:
+        if tqdm:
+            with tqdm(
+                total=total,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                desc=desc,
+            ) as bar:
+                for chunk in response.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        handle.write(chunk)
+                        bar.update(len(chunk))
+        else:
+            for chunk in response.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    handle.write(chunk)
+
+
 def save_debug_html(html: str, debug_dir: Optional[Path], stem: str) -> Optional[Path]:
     if debug_dir is None:
         return None
@@ -380,7 +425,7 @@ def extract_html_title(html: str) -> Optional[str]:
 
 
 def download_google_drive(
-    url: str, dest_dir: Path, debug_dir: Optional[Path]
+    url: str, dest_dir: Path, debug_dir: Optional[Path], progress: bool
 ) -> List[Path]:
     ensure_module("requests", "requests")
     import requests  # type: ignore
@@ -451,10 +496,7 @@ def download_google_drive(
 
     filename = Path(filename).name
     target = dest_dir / filename
-    with target.open("wb") as handle:
-        for chunk in response.iter_content(chunk_size=1024 * 256):
-            if chunk:
-                handle.write(chunk)
+    write_stream_to_file(response, target, filename, progress)
     return [target]
 
 
@@ -464,7 +506,7 @@ def filename_from_url(url: str) -> Optional[str]:
     return unquote(name) if name else None
 
 
-def download_dropbox(url: str, dest_dir: Path) -> List[Path]:
+def download_dropbox(url: str, dest_dir: Path, progress: bool) -> List[Path]:
     ensure_module("requests", "requests")
     import requests  # type: ignore
 
@@ -486,10 +528,7 @@ def download_dropbox(url: str, dest_dir: Path) -> List[Path]:
 
     filename = Path(filename).name
     target = dest_dir / filename
-    with target.open("wb") as handle:
-        for chunk in response.iter_content(chunk_size=1024 * 256):
-            if chunk:
-                handle.write(chunk)
+    write_stream_to_file(response, target, filename, progress)
     return [target]
 
 
@@ -552,7 +591,7 @@ def download_mega(url: str, dest_dir: Path) -> List[Path]:
 
 
 def download_telegram(
-    url: str, dest_dir: Path, config: TelegramConfig
+    url: str, dest_dir: Path, config: TelegramConfig, progress: bool
 ) -> List[Path]:
     ensure_module("telethon", "telethon")
     from telethon.sync import TelegramClient  # type: ignore
@@ -561,6 +600,28 @@ def download_telegram(
     if not info:
         raise RuntimeError(f"Unsupported Telegram message URL: {url}")
 
+    progress_bar = None
+    progress_callback = None
+    if progress:
+        tqdm = get_tqdm()
+        if tqdm:
+            progress_bar = tqdm(
+                total=0,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                desc="Telegram",
+            )
+
+            def progress_callback(current: int, total: int) -> None:
+                if not progress_bar:
+                    return
+                if total and progress_bar.total != total:
+                    progress_bar.total = total
+                delta = current - progress_bar.n
+                if delta > 0:
+                    progress_bar.update(delta)
+
     with TelegramClient(config.session, config.api_id, config.api_hash) as client:
         client.start()
         message = client.get_messages(info["peer"], ids=info["msg_id"])
@@ -568,7 +629,14 @@ def download_telegram(
             raise RuntimeError("Telegram message not found or inaccessible.")
         if not message.media:
             raise RuntimeError("Telegram message has no media to download.")
-        result = client.download_media(message, file=str(dest_dir))
+        result = client.download_media(
+            message,
+            file=str(dest_dir),
+            progress_callback=progress_callback,
+        )
+
+    if progress_bar:
+        progress_bar.close()
 
     if not result:
         raise RuntimeError("Telegram download produced no files.")
@@ -689,11 +757,12 @@ def download_url(
     dest_dir: Path,
     debug_dir: Optional[Path],
     telegram: Optional[TelegramConfig],
+    progress: bool,
 ) -> List[Path]:
     if is_google_drive(url):
-        return download_google_drive(url, dest_dir, debug_dir)
+        return download_google_drive(url, dest_dir, debug_dir, progress)
     if is_dropbox(url):
-        return download_dropbox(url, dest_dir)
+        return download_dropbox(url, dest_dir, progress)
     if is_mega(url):
         return download_mega(url, dest_dir)
     if is_telegram(url):
@@ -702,7 +771,7 @@ def download_url(
                 "Telegram URL detected but API credentials are missing. "
                 "Provide --tg-api-id and --tg-api-hash (or TG_API_ID/TG_API_HASH)."
             )
-        return download_telegram(url, dest_dir, telegram)
+        return download_telegram(url, dest_dir, telegram, progress)
     raise RuntimeError(f"Unsupported URL: {url}")
 
 
@@ -816,6 +885,11 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars (still shows Mega CLI progress).",
+    )
+    parser.add_argument(
         "--tg-api-id",
         default=None,
         help="Telegram API ID (or set TG_API_ID). Required for Telegram URLs.",
@@ -858,6 +932,7 @@ def main() -> int:
         work_dir.mkdir(parents=True, exist_ok=True)
 
     telegram = parse_telegram_config(args)
+    progress_enabled = not args.no_progress
 
     all_moved: List[Path] = []
     for url in args.url:
@@ -866,7 +941,13 @@ def main() -> int:
             dir=str(work_dir) if work_dir else None,
         ) as tmp_dir:
             tmp_path = Path(tmp_dir)
-            downloaded = download_url(url, tmp_path, debug_dir, telegram)
+            downloaded = download_url(
+                url,
+                tmp_path,
+                debug_dir,
+                telegram,
+                progress_enabled,
+            )
             moved = process_downloads(downloaded, modules_dir, args.force, work_dir)
             all_moved.extend(moved)
 
