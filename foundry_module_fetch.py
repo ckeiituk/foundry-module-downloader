@@ -600,28 +600,6 @@ def download_telegram(
     if not info:
         raise RuntimeError(f"Unsupported Telegram message URL: {url}")
 
-    progress_bar = None
-    progress_callback = None
-    if progress:
-        tqdm = get_tqdm()
-        if tqdm:
-            progress_bar = tqdm(
-                total=0,
-                unit="B",
-                unit_scale=True,
-                unit_divisor=1024,
-                desc="Telegram",
-            )
-
-            def progress_callback(current: int, total: int) -> None:
-                if not progress_bar:
-                    return
-                if total and progress_bar.total != total:
-                    progress_bar.total = total
-                delta = current - progress_bar.n
-                if delta > 0:
-                    progress_bar.update(delta)
-
     with TelegramClient(config.session, config.api_id, config.api_hash) as client:
         client.start()
         message = client.get_messages(info["peer"], ids=info["msg_id"])
@@ -629,14 +607,40 @@ def download_telegram(
             raise RuntimeError("Telegram message not found or inaccessible.")
         if not message.media:
             raise RuntimeError("Telegram message has no media to download.")
-        result = client.download_media(
-            message,
-            file=str(dest_dir),
-            progress_callback=progress_callback,
-        )
+        if progress:
+            tqdm = get_tqdm()
+        else:
+            tqdm = None
 
-    if progress_bar:
-        progress_bar.close()
+        if tqdm and hasattr(client, "iter_download"):
+            file_name = None
+            if message.file:
+                file_name = message.file.name or None
+                if not file_name and message.file.ext:
+                    file_name = f"telegram_{message.id}{message.file.ext}"
+            if not file_name:
+                file_name = f"telegram_{message.id}"
+
+            target = dest_dir / Path(file_name).name
+            total = message.file.size if message.file and message.file.size else None
+            with tqdm(
+                total=total,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                desc="Telegram",
+            ) as bar:
+                with target.open("wb") as handle:
+                    for chunk in client.iter_download(message.media):
+                        handle.write(chunk)
+                        bar.update(len(chunk))
+            result = str(target)
+        else:
+            result = client.download_media(
+                message,
+                file=str(dest_dir),
+                progress_callback=None,
+            )
 
     if not result:
         raise RuntimeError("Telegram download produced no files.")
