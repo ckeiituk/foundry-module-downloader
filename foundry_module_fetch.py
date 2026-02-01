@@ -142,7 +142,7 @@ def free_bytes(path: Path) -> int:
         return 0
 
 
-def select_work_dir(explicit: Optional[Path]) -> Optional[Path]:
+def select_work_dir(explicit: Optional[Path], expected_bytes: Optional[int]) -> Optional[Path]:
     if explicit is not None:
         return explicit
 
@@ -159,14 +159,54 @@ def select_work_dir(explicit: Optional[Path]) -> Optional[Path]:
 
     default_free = free_bytes(default_tmp)
     fallback_free = free_bytes(fallback_tmp)
+
+    if expected_bytes is not None:
+        if default_free >= expected_bytes:
+            if default_free < MIN_TMP_FREE_BYTES:
+                print(
+                    "Warning: default temp dir "
+                    f"{default_tmp} has only {format_bytes(default_free)} free, "
+                    f"but expected download size is {format_bytes(expected_bytes)}.",
+                    file=sys.stderr,
+                )
+            return None
+
+        if fallback_free > default_free:
+            print(
+                "Default temp dir "
+                f"{default_tmp} has only {format_bytes(default_free)} free, "
+                f"expected download size is {format_bytes(expected_bytes)}; "
+                f"using {fallback_tmp} ({format_bytes(fallback_free)} free).",
+                file=sys.stderr,
+            )
+            return fallback_tmp
+
+        print(
+            "Warning: default temp dir "
+            f"{default_tmp} has only {format_bytes(default_free)} free, "
+            f"expected download size is {format_bytes(expected_bytes)}; "
+            "download may fail.",
+            file=sys.stderr,
+        )
+        return None
+
     if default_free < MIN_TMP_FREE_BYTES and fallback_free > default_free:
         print(
             "Default temp dir "
-            f"{default_tmp} has only {format_bytes(default_free)} free; "
+            f"{default_tmp} has only {format_bytes(default_free)} free and "
+            "download size is unknown; "
             f"using {fallback_tmp} ({format_bytes(fallback_free)} free).",
             file=sys.stderr,
         )
         return fallback_tmp
+
+    if default_free < MIN_TMP_FREE_BYTES:
+        print(
+            "Warning: default temp dir "
+            f"{default_tmp} has only {format_bytes(default_free)} free and "
+            "download size is unknown; download may fail.",
+            file=sys.stderr,
+        )
 
     return None
 
@@ -267,6 +307,59 @@ def parse_yandex_public_url(url: str) -> tuple[str, Optional[str]]:
     if path_from_url:
         return public_url, path_from_url
     return public_url, None
+
+
+def yandex_expected_size(url: str) -> Optional[int]:
+    ensure_module("requests", "requests")
+    import requests  # type: ignore
+
+    if is_yandex_direct(url):
+        try:
+            response = requests.head(url, allow_redirects=True, timeout=15)
+            response.raise_for_status()
+            length = response.headers.get("content-length")
+            if length and length.isdigit():
+                return int(length)
+        except Exception:
+            return None
+
+    public_url, public_path = parse_yandex_public_url(url)
+    params = {"public_key": public_url}
+    if public_path:
+        params["path"] = public_path
+    try:
+        response = requests.get(
+            "https://cloud-api.yandex.net/v1/disk/public/resources",
+            params=params,
+            timeout=15,
+        )
+        response.raise_for_status()
+    except Exception:
+        return None
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    item_type = payload.get("type")
+    if item_type and item_type != "file":
+        return None
+
+    size = payload.get("size")
+    if isinstance(size, int):
+        return size
+    if isinstance(size, str) and size.isdigit():
+        return int(size)
+    return None
+
+
+def estimate_download_size(url: str) -> Optional[int]:
+    if is_yandex_disk(url) or is_yandex_direct(url):
+        return yandex_expected_size(url)
+    return None
 
 
 def normalize_telegram_url(url: str) -> str:
@@ -949,7 +1042,7 @@ def download_url(
     telegram: Optional[TelegramConfig],
     progress: bool,
 ) -> List[Path]:
-    if is_yandex_disk(url):
+    if is_yandex_disk(url) or is_yandex_direct(url):
         return download_yandex_disk(url, dest_dir, progress)
     if is_google_drive(url):
         return download_google_drive(url, dest_dir, debug_dir, progress)
@@ -1129,16 +1222,13 @@ def main() -> int:
     modules_dir.mkdir(parents=True, exist_ok=True)
 
     debug_dir = Path(args.debug_html).expanduser() if args.debug_html else None
-    work_dir = Path(args.work_dir).expanduser() if args.work_dir else None
-    work_dir = select_work_dir(work_dir)
-    if work_dir:
-        work_dir.mkdir(parents=True, exist_ok=True)
+    explicit_work_dir = Path(args.work_dir).expanduser() if args.work_dir else None
 
     base_tmp_dirs = [Path(tempfile.gettempdir())]
     if DEFAULT_FALLBACK_TMP_DIR.is_dir():
         base_tmp_dirs.append(DEFAULT_FALLBACK_TMP_DIR)
-    if work_dir and work_dir not in base_tmp_dirs:
-        base_tmp_dirs.append(work_dir)
+    if explicit_work_dir and explicit_work_dir not in base_tmp_dirs:
+        base_tmp_dirs.append(explicit_work_dir)
 
     stale_dirs = find_stale_temp_dirs(base_tmp_dirs, STALE_TMP_AGE_SECONDS)
     if stale_dirs:
@@ -1163,6 +1253,10 @@ def main() -> int:
 
     all_moved: List[Path] = []
     for url in args.url:
+        expected_size = estimate_download_size(url)
+        work_dir = select_work_dir(explicit_work_dir, expected_size)
+        if work_dir:
+            work_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
             prefix="foundry_download_",
             dir=str(work_dir) if work_dir else None,
