@@ -28,6 +28,11 @@ ARCHIVE_TAR_EXTS = (
 )
 ARCHIVE_7Z_EXTS = (".7z", ".rar")
 TELEGRAM_HOSTS = ("t.me", "telegram.me", "telegram.dog")
+YANDEX_HOSTS = ("disk.yandex.ru", "disk.yandex.com", "yadi.sk")
+YANDEX_DIRECT_HOSTS = (
+    "downloader.disk.yandex.ru",
+    "downloader.disk.yandex.com",
+)
 
 
 @dataclass(frozen=True)
@@ -126,6 +131,39 @@ def is_mega(url: str) -> bool:
 def is_dropbox(url: str) -> bool:
     host = urlparse(url).netloc.lower()
     return host.endswith("dropbox.com") or host.endswith("dropboxusercontent.com")
+
+
+def is_yandex_disk(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return any(host == candidate or host.endswith(f".{candidate}") for candidate in YANDEX_HOSTS)
+
+
+def is_yandex_direct(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return any(host == candidate or host.endswith(f".{candidate}") for candidate in YANDEX_DIRECT_HOSTS)
+
+
+def parse_yandex_public_url(url: str) -> tuple[str, Optional[str]]:
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    query_path = params.get("path", [None])[0]
+
+    parts = [part for part in parsed.path.split("/") if part]
+    public_url = url
+    path_from_url: Optional[str] = None
+    if parts:
+        prefix = parts[0]
+        if prefix in ("d", "i", "s", "public") and len(parts) >= 2:
+            base_path = "/" + "/".join(parts[:2])
+            public_url = parsed._replace(path=base_path, query="", fragment="").geturl()
+            if len(parts) > 2:
+                path_from_url = "/" + "/".join(parts[2:])
+
+    if query_path:
+        return public_url, query_path
+    if path_from_url:
+        return public_url, path_from_url
+    return public_url, None
 
 
 def normalize_telegram_url(url: str) -> str:
@@ -532,6 +570,51 @@ def download_dropbox(url: str, dest_dir: Path, progress: bool) -> List[Path]:
     return [target]
 
 
+def download_yandex_disk(url: str, dest_dir: Path, progress: bool) -> List[Path]:
+    ensure_module("requests", "requests")
+    import requests  # type: ignore
+
+    download_url = url
+    if not is_yandex_direct(url):
+        public_url, public_path = parse_yandex_public_url(url)
+        params = {"public_key": public_url}
+        if public_path:
+            params["path"] = public_path
+        response = requests.get(
+            "https://cloud-api.yandex.net/v1/disk/public/resources/download",
+            params=params,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        href = payload.get("href")
+        if not href:
+            error = payload.get("error") or "unknown"
+            description = payload.get("description") or ""
+            hint = f": {description}" if description else ""
+            raise RuntimeError(f"Yandex Disk download error: {error}{hint}")
+        download_url = href
+
+    response = requests.get(download_url, stream=True, allow_redirects=True)
+    response.raise_for_status()
+
+    content_type = response.headers.get("content-type", "")
+    if "text/html" in content_type and not response.headers.get("content-disposition"):
+        raise RuntimeError(
+            "Yandex Disk returned HTML instead of a file. Check sharing permissions."
+        )
+
+    filename = filename_from_cd(response.headers.get("content-disposition"))
+    if not filename:
+        filename = filename_from_url(response.url) or filename_from_url(download_url)
+    if not filename:
+        raise RuntimeError("Could not determine Yandex Disk filename.")
+
+    filename = Path(filename).name
+    target = dest_dir / filename
+    write_stream_to_file(response, target, filename, progress)
+    return [target]
+
+
 def download_mega(url: str, dest_dir: Path) -> List[Path]:
     if shutil.which("mega-get"):
         run(["mega-get", url, str(dest_dir)])
@@ -763,6 +846,8 @@ def download_url(
     telegram: Optional[TelegramConfig],
     progress: bool,
 ) -> List[Path]:
+    if is_yandex_disk(url):
+        return download_yandex_disk(url, dest_dir, progress)
     if is_google_drive(url):
         return download_google_drive(url, dest_dir, debug_dir, progress)
     if is_dropbox(url):
@@ -851,14 +936,15 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Download Foundry modules from Google Drive, Dropbox, Mega, or Telegram "
+            "Download Foundry modules from Yandex Disk, Google Drive, Dropbox, Mega, "
+            "or Telegram "
             "links, extract archives, and set ownership."
         )
     )
     parser.add_argument(
         "url",
         nargs="+",
-        help="Google Drive, Dropbox, Mega, or Telegram message URL",
+        help="Yandex Disk, Google Drive, Dropbox, Mega, or Telegram message URL",
     )
     parser.add_argument(
         "--modules-dir",
