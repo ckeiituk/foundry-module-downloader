@@ -8,6 +8,7 @@ import site
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional
@@ -15,6 +16,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 DEFAULT_MODULES_DIR = Path("/opt/foundry/data/Data/modules")
 DEFAULT_OWNER = "foundry:foundry-files"
+DEFAULT_FALLBACK_TMP_DIR = Path("/var/tmp")
+MIN_TMP_FREE_BYTES = 2 * 1024 * 1024 * 1024
+STALE_TMP_AGE_SECONDS = 24 * 60 * 60
+TMP_DIR_PREFIXES = ("foundry_download_", "foundry_extract_")
 
 ARCHIVE_TAR_EXTS = (
     ".tar",
@@ -116,6 +121,104 @@ def get_tqdm() -> Optional[Callable[..., object]]:
         print(f"Warning: tqdm unavailable ({exc}). Progress disabled.", file=sys.stderr)
         return None
     return tqdm
+
+
+def format_bytes(value: int) -> str:
+    size = float(value)
+    units = ("B", "KB", "MB", "GB", "TB")
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)}B"
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{int(value)}B"
+
+
+def free_bytes(path: Path) -> int:
+    try:
+        return shutil.disk_usage(path).free
+    except (FileNotFoundError, PermissionError):
+        return 0
+
+
+def select_work_dir(explicit: Optional[Path]) -> Optional[Path]:
+    if explicit is not None:
+        return explicit
+
+    default_tmp = Path(tempfile.gettempdir())
+    fallback_tmp = DEFAULT_FALLBACK_TMP_DIR if DEFAULT_FALLBACK_TMP_DIR.is_dir() else None
+    if not fallback_tmp:
+        return None
+
+    try:
+        if default_tmp.resolve() == fallback_tmp.resolve():
+            return None
+    except FileNotFoundError:
+        pass
+
+    default_free = free_bytes(default_tmp)
+    fallback_free = free_bytes(fallback_tmp)
+    if default_free < MIN_TMP_FREE_BYTES and fallback_free > default_free:
+        print(
+            "Default temp dir "
+            f"{default_tmp} has only {format_bytes(default_free)} free; "
+            f"using {fallback_tmp} ({format_bytes(fallback_free)} free).",
+            file=sys.stderr,
+        )
+        return fallback_tmp
+
+    return None
+
+
+def collect_temp_dirs(base_dir: Path) -> List[Path]:
+    if not base_dir.is_dir():
+        return []
+    try:
+        entries = list(base_dir.iterdir())
+    except PermissionError:
+        return []
+    found: List[Path] = []
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        if entry.name.startswith(TMP_DIR_PREFIXES):
+            found.append(entry)
+    return found
+
+
+def find_stale_temp_dirs(base_dirs: Iterable[Path], min_age_seconds: int) -> List[Path]:
+    now = time.time()
+    stale: List[Path] = []
+    for base_dir in base_dirs:
+        for entry in collect_temp_dirs(base_dir):
+            try:
+                age = now - entry.stat().st_mtime
+            except OSError:
+                continue
+            if age >= min_age_seconds:
+                stale.append(entry)
+    return stale
+
+
+def cleanup_temp_dirs(paths: Iterable[Path]) -> List[Path]:
+    removed: List[Path] = []
+    for path in paths:
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            continue
+        removed.append(path)
+    return removed
+
+
+def summarize_paths(paths: List[Path], limit: int = 5) -> str:
+    if not paths:
+        return ""
+    preview = ", ".join(str(path) for path in paths[:limit])
+    if len(paths) > limit:
+        return f"{preview}, …"
+    return preview
 
 
 def is_google_drive(url: str) -> bool:
@@ -970,7 +1073,8 @@ def main() -> int:
         "--work-dir",
         default="",
         help=(
-            "Directory for temporary downloads/extraction (default: system tmp). "
+            "Directory for temporary downloads/extraction (default: system tmp; "
+            "auto-fallback to /var/tmp if free space is low). "
             "Useful if /tmp is small (tmpfs)."
         ),
     )
@@ -978,6 +1082,14 @@ def main() -> int:
         "--no-progress",
         action="store_true",
         help="Disable tqdm progress bars (still shows Mega CLI progress).",
+    )
+    parser.add_argument(
+        "--cleanup-temp",
+        action="store_true",
+        help=(
+            "Remove stale temporary directories from previous runs "
+            f"(older than {STALE_TMP_AGE_SECONDS // 3600}h)."
+        ),
     )
     parser.add_argument(
         "--tg-api-id",
@@ -1018,8 +1130,33 @@ def main() -> int:
 
     debug_dir = Path(args.debug_html).expanduser() if args.debug_html else None
     work_dir = Path(args.work_dir).expanduser() if args.work_dir else None
+    work_dir = select_work_dir(work_dir)
     if work_dir:
         work_dir.mkdir(parents=True, exist_ok=True)
+
+    base_tmp_dirs = [Path(tempfile.gettempdir())]
+    if DEFAULT_FALLBACK_TMP_DIR.is_dir():
+        base_tmp_dirs.append(DEFAULT_FALLBACK_TMP_DIR)
+    if work_dir and work_dir not in base_tmp_dirs:
+        base_tmp_dirs.append(work_dir)
+
+    stale_dirs = find_stale_temp_dirs(base_tmp_dirs, STALE_TMP_AGE_SECONDS)
+    if stale_dirs:
+        if args.cleanup_temp:
+            removed = cleanup_temp_dirs(stale_dirs)
+            if removed:
+                print(
+                    "Removed stale temp directories: "
+                    f"{summarize_paths(removed)}",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                "Warning: found stale temp directories from previous runs: "
+                f"{summarize_paths(stale_dirs)}. "
+                "Use --cleanup-temp to remove them.",
+                file=sys.stderr,
+            )
 
     telegram = parse_telegram_config(args)
     progress_enabled = not args.no_progress
