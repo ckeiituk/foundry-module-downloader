@@ -37,6 +37,7 @@ YANDEX_HOSTS = ("disk.yandex.ru", "disk.yandex.com", "yadi.sk")
 YANDEX_DIRECT_HOSTS = (
     "downloader.disk.yandex.ru",
     "downloader.disk.yandex.com",
+    "storage.yandex.net",
 )
 
 
@@ -290,6 +291,8 @@ def parse_yandex_public_url(url: str) -> tuple[str, Optional[str]]:
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
     query_path = params.get("path", [None])[0]
+    if query_path:
+        query_path = unquote(query_path)
 
     parts = [part for part in parsed.path.split("/") if part]
     public_url = url
@@ -300,7 +303,8 @@ def parse_yandex_public_url(url: str) -> tuple[str, Optional[str]]:
             base_path = "/" + "/".join(parts[:2])
             public_url = parsed._replace(path=base_path, query="", fragment="").geturl()
             if len(parts) > 2:
-                path_from_url = "/" + "/".join(parts[2:])
+                # Cloud API expects a decoded path; requests will encode params once.
+                path_from_url = "/" + unquote("/".join(parts[2:]))
 
     if query_path:
         return public_url, query_path
@@ -731,6 +735,7 @@ def download_google_drive(
     filename = Path(filename).name
     target = dest_dir / filename
     write_stream_to_file(response, target, filename, progress)
+    ensure_not_html_download(target, "Google Drive", url)
     return [target]
 
 
@@ -738,6 +743,78 @@ def filename_from_url(url: str) -> Optional[str]:
     parsed = urlparse(url)
     name = Path(parsed.path).name
     return unquote(name) if name else None
+
+
+def is_http_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme in ("http", "https")
+
+
+def read_text_prefix(path: Path, limit: int = 64 * 1024) -> str:
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(limit)
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="ignore")
+
+
+def is_probably_html_file(path: Path) -> bool:
+    suffix = path.suffix.lower()
+    if suffix in (".html", ".htm", ".xhtml", ".shtml"):
+        return True
+
+    text = read_text_prefix(path).lstrip().lower()
+    if not text:
+        return False
+    if text.startswith("<!doctype html") or text.startswith("<html"):
+        return True
+    return "<html" in text[:4096] and ("<head" in text[:4096] or "<body" in text[:4096])
+
+
+def ensure_not_html_download(path: Path, source: str, url: str) -> None:
+    if not is_probably_html_file(path):
+        return
+    title = extract_html_title(read_text_prefix(path))
+    title_hint = f" (page: {title})" if title else ""
+    raise RuntimeError(
+        f"{source} returned HTML instead of a file for URL: {url}{title_hint}"
+    )
+
+
+def download_with_wget(url: str, dest_dir: Path, progress: bool) -> List[Path]:
+    if not shutil.which("wget"):
+        raise RuntimeError("wget is not installed.")
+
+    before = {entry.resolve() for entry in dest_dir.iterdir()}
+    cmd = [
+        "wget",
+        "--content-disposition",
+        "--trust-server-names",
+        "--max-redirect=20",
+        "--tries=3",
+        "--timeout=30",
+        "-P",
+        str(dest_dir),
+        url,
+    ]
+    if not progress:
+        cmd.insert(1, "--no-verbose")
+
+    run(cmd)
+
+    files = [entry for entry in dest_dir.iterdir() if entry.is_file()]
+    created = [entry for entry in files if entry.resolve() not in before]
+    if created:
+        candidates = created
+    elif files:
+        candidates = files
+    else:
+        raise RuntimeError("wget did not create any files.")
+
+    downloaded = max(candidates, key=lambda item: item.stat().st_mtime)
+    ensure_not_html_download(downloaded, "wget", url)
+    return [downloaded]
 
 
 def download_dropbox(url: str, dest_dir: Path, progress: bool) -> List[Path]:
@@ -763,6 +840,7 @@ def download_dropbox(url: str, dest_dir: Path, progress: bool) -> List[Path]:
     filename = Path(filename).name
     target = dest_dir / filename
     write_stream_to_file(response, target, filename, progress)
+    ensure_not_html_download(target, "Dropbox", url)
     return [target]
 
 
@@ -808,6 +886,7 @@ def download_yandex_disk(url: str, dest_dir: Path, progress: bool) -> List[Path]
     filename = Path(filename).name
     target = dest_dir / filename
     write_stream_to_file(response, target, filename, progress)
+    ensure_not_html_download(target, "Yandex Disk", url)
     return [target]
 
 
@@ -1042,22 +1121,47 @@ def download_url(
     telegram: Optional[TelegramConfig],
     progress: bool,
 ) -> List[Path]:
-    if is_yandex_disk(url) or is_yandex_direct(url):
-        return download_yandex_disk(url, dest_dir, progress)
-    if is_google_drive(url):
-        return download_google_drive(url, dest_dir, debug_dir, progress)
-    if is_dropbox(url):
-        return download_dropbox(url, dest_dir, progress)
-    if is_mega(url):
-        return download_mega(url, dest_dir)
-    if is_telegram(url):
-        if telegram is None:
+    primary_error: Optional[Exception] = None
+    try:
+        if is_yandex_disk(url) or is_yandex_direct(url):
+            return download_yandex_disk(url, dest_dir, progress)
+        if is_google_drive(url):
+            return download_google_drive(url, dest_dir, debug_dir, progress)
+        if is_dropbox(url):
+            return download_dropbox(url, dest_dir, progress)
+        if is_mega(url):
+            return download_mega(url, dest_dir)
+        if is_telegram(url):
+            if telegram is None:
+                raise RuntimeError(
+                    "Telegram URL detected but API credentials are missing. "
+                    "Provide --tg-api-id and --tg-api-hash (or TG_API_ID/TG_API_HASH)."
+                )
+            return download_telegram(url, dest_dir, telegram, progress)
+        if not is_http_url(url):
+            raise RuntimeError(f"Unsupported URL: {url}")
+    except Exception as exc:
+        primary_error = exc
+
+    if not is_http_url(url):
+        if primary_error is not None:
+            raise primary_error
+        raise RuntimeError(f"Unsupported URL: {url}")
+
+    if primary_error is not None:
+        print(
+            f"Primary downloader failed ({primary_error}). Trying wget fallback...",
+            file=sys.stderr,
+        )
+    try:
+        return download_with_wget(url, dest_dir, progress)
+    except Exception as wget_error:
+        if primary_error is not None:
             raise RuntimeError(
-                "Telegram URL detected but API credentials are missing. "
-                "Provide --tg-api-id and --tg-api-hash (or TG_API_ID/TG_API_HASH)."
-            )
-        return download_telegram(url, dest_dir, telegram, progress)
-    raise RuntimeError(f"Unsupported URL: {url}")
+                f"Primary downloader failed: {primary_error}; "
+                f"wget fallback failed: {wget_error}"
+            ) from wget_error
+        raise
 
 
 def parse_telegram_config(args: argparse.Namespace) -> Optional[TelegramConfig]:
