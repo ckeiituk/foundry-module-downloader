@@ -4,3 +4,5 @@ __pycache__/
 *.pyd
 .env
 *.session
+.venv/
+.pytest_cache/

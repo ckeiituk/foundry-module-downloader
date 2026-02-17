@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 DEFAULT_MODULES_DIR = Path("/opt/foundry/data/Data/modules")
 DEFAULT_OWNER = "foundry:foundry-files"
@@ -525,8 +525,7 @@ def normalize_dropbox_url(url: str) -> str:
 
     params = parse_qs(parsed.query)
     params["dl"] = ["1"]
-    query = "&".join(f"{key}={value[0]}" for key, value in params.items())
-    return parsed._replace(query=query).geturl()
+    return parsed._replace(query=urlencode(params, doseq=True)).geturl()
 
 
 def extract_gdrive_file_id(url: str) -> Optional[str]:
@@ -1079,8 +1078,9 @@ def move_or_merge(src: Path, dest_root: Path, force: bool) -> Path:
 
 
 def chown_paths(paths: Iterable[Path], owner: str) -> None:
-    for path in paths:
-        run(["chown", "-R", owner, str(path)])
+    path_list = [str(p) for p in paths]
+    if path_list:
+        run(["chown", "-R", owner, *path_list])
 
 
 def process_downloads(
@@ -1121,6 +1121,7 @@ def download_url(
     telegram: Optional[TelegramConfig],
     progress: bool,
 ) -> List[Path]:
+    http_fallback = is_http_url(url)
     primary_error: Optional[Exception] = None
     try:
         if is_yandex_disk(url) or is_yandex_direct(url):
@@ -1138,15 +1139,12 @@ def download_url(
                     "Provide --tg-api-id and --tg-api-hash (or TG_API_ID/TG_API_HASH)."
                 )
             return download_telegram(url, dest_dir, telegram, progress)
-        if not is_http_url(url):
+        if not http_fallback:
             raise RuntimeError(f"Unsupported URL: {url}")
     except Exception as exc:
+        if not http_fallback:
+            raise
         primary_error = exc
-
-    if not is_http_url(url):
-        if primary_error is not None:
-            raise primary_error
-        raise RuntimeError(f"Unsupported URL: {url}")
 
     if primary_error is not None:
         print(
