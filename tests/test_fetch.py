@@ -6,7 +6,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from foundry_module_fetch import (
+    TelegramConfig,
     ensure_not_html_download,
+    estimate_download_size,
     extract_gdrive_file_id,
     filename_from_cd,
     is_dropbox,
@@ -232,3 +234,24 @@ class TestHtmlGuard:
         f = tmp_path / "module.zip"
         f.write_bytes(b"PK\x03\x04" + b"\x00" * 100)
         ensure_not_html_download(f, "TestSource", "https://example.com")  # no raise
+
+
+class TestEstimateDownloadSize:
+    def test_uses_yandex_estimator(self, monkeypatch):
+        import foundry_module_fetch as fetch
+
+        monkeypatch.setattr(fetch, "yandex_expected_size", lambda url: 55)
+        assert estimate_download_size("https://disk.yandex.ru/d/abc") == 55
+
+    def test_telegram_uses_telegram_estimator(self, monkeypatch):
+        import foundry_module_fetch as fetch
+
+        config = TelegramConfig(api_id=1, api_hash="hash", session="session")
+        monkeypatch.setattr(fetch, "telegram_expected_size", lambda url, cfg: 123)
+        assert estimate_download_size("https://t.me/c/1234567890/99", config) == 123
+
+    def test_telegram_without_config_returns_none(self, monkeypatch):
+        import foundry_module_fetch as fetch
+
+        monkeypatch.setattr(fetch, "telegram_expected_size", lambda url, cfg: 123)
+        assert estimate_download_size("https://t.me/c/1234567890/99") is None

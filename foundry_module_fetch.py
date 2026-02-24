@@ -360,9 +360,37 @@ def yandex_expected_size(url: str) -> Optional[int]:
     return None
 
 
-def estimate_download_size(url: str) -> Optional[int]:
+def telegram_expected_size(url: str, config: TelegramConfig) -> Optional[int]:
+    info = parse_telegram_message_url(url)
+    if not info:
+        return None
+
+    try:
+        ensure_module("telethon", "telethon")
+        from telethon.sync import TelegramClient  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        with TelegramClient(config.session, config.api_id, config.api_hash) as client:
+            client.start()
+            message = client.get_messages(info["peer"], ids=info["msg_id"])
+            if not message or not message.file or not message.file.size:
+                return None
+            if isinstance(message.file.size, int) and message.file.size > 0:
+                return message.file.size
+    except Exception:
+        return None
+    return None
+
+
+def estimate_download_size(
+    url: str, telegram: Optional[TelegramConfig] = None
+) -> Optional[int]:
     if is_yandex_disk(url) or is_yandex_direct(url):
         return yandex_expected_size(url)
+    if telegram is not None and is_telegram(url):
+        return telegram_expected_size(url, telegram)
     return None
 
 
@@ -1355,7 +1383,7 @@ def main() -> int:
 
     all_moved: List[Path] = []
     for url in args.url:
-        expected_size = estimate_download_size(url)
+        expected_size = estimate_download_size(url, telegram)
         work_dir = select_work_dir(explicit_work_dir, expected_size)
         if work_dir:
             work_dir.mkdir(parents=True, exist_ok=True)
