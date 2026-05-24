@@ -18,6 +18,8 @@ DEFAULT_MODULES_DIR = Path("/opt/foundry/data/Data/modules")
 DEFAULT_OWNER = "foundry:foundry-files"
 DEFAULT_FALLBACK_TMP_DIR = Path("/var/tmp")
 MIN_TMP_FREE_BYTES = 2 * 1024 * 1024 * 1024
+EXTRACT_SAFETY_BYTES = 64 * 1024 * 1024
+FALLBACK_EXPANSION_RATIO = 4
 STALE_TMP_AGE_SECONDS = 24 * 60 * 60
 TMP_DIR_PREFIXES = ("foundry_download_", "foundry_extract_")
 
@@ -210,6 +212,97 @@ def select_work_dir(explicit: Optional[Path], expected_bytes: Optional[int]) -> 
         )
 
     return None
+
+
+def archive_uncompressed_size(archive_path: Path) -> Optional[int]:
+    try:
+        result = subprocess.run(
+            ["7z", "l", "-slt", str(archive_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, FileNotFoundError):
+        return None
+    if result.returncode != 0:
+        return None
+
+    total = 0
+    saw_entry = False
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("Size = "):
+            continue
+        value = stripped[len("Size = "):].strip()
+        try:
+            total += int(value)
+        except ValueError:
+            continue
+        saw_entry = True
+    return total if saw_entry else None
+
+
+def estimate_extract_bytes(archive_path: Path) -> int:
+    size = archive_uncompressed_size(archive_path)
+    if size is not None:
+        return size + EXTRACT_SAFETY_BYTES
+    try:
+        archive_size = archive_path.stat().st_size
+    except OSError:
+        return EXTRACT_SAFETY_BYTES
+    return archive_size * FALLBACK_EXPANSION_RATIO + EXTRACT_SAFETY_BYTES
+
+
+def select_extract_dir(
+    explicit_work_dir: Optional[Path],
+    current_work_dir: Optional[Path],
+    required_bytes: int,
+) -> Optional[Path]:
+    if explicit_work_dir is not None:
+        free = free_bytes(explicit_work_dir)
+        if free < required_bytes:
+            print(
+                f"Warning: --work-dir {explicit_work_dir} has only "
+                f"{format_bytes(free)} free, but extraction needs about "
+                f"{format_bytes(required_bytes)}; extraction may fail.",
+                file=sys.stderr,
+            )
+        return explicit_work_dir
+
+    default_tmp = Path(tempfile.gettempdir())
+    seen: List[Path] = []
+    candidates: List[Path] = []
+
+    def add(candidate: Optional[Path]) -> None:
+        if candidate is None:
+            return
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if resolved in seen:
+            return
+        seen.append(resolved)
+        candidates.append(candidate)
+
+    add(current_work_dir)
+    add(default_tmp)
+    if DEFAULT_FALLBACK_TMP_DIR.is_dir():
+        add(DEFAULT_FALLBACK_TMP_DIR)
+
+    best: Optional[Path] = None
+    best_free = -1
+    for candidate in candidates:
+        free = free_bytes(candidate)
+        if free >= required_bytes:
+            return None if candidate == default_tmp else candidate
+        if free > best_free:
+            best_free = free
+            best = candidate
+
+    if best is None or best == default_tmp:
+        return None
+    return best
 
 
 def collect_temp_dirs(base_dir: Path) -> List[Path]:
@@ -1116,6 +1209,7 @@ def process_downloads(
     modules_dir: Path,
     force: bool,
     work_dir: Optional[Path],
+    explicit_work_dir: Optional[Path] = None,
 ) -> List[Path]:
     moved: List[Path] = []
     for item in downloaded:
@@ -1125,9 +1219,22 @@ def process_downloads(
 
         kind = detect_archive(item)
         if kind:
+            required_bytes = estimate_extract_bytes(item)
+            extract_work_dir = select_extract_dir(
+                explicit_work_dir, work_dir, required_bytes
+            )
+            if explicit_work_dir is None and extract_work_dir != work_dir:
+                target = extract_work_dir or Path(tempfile.gettempdir())
+                print(
+                    f"Extraction needs about {format_bytes(required_bytes)}; "
+                    f"using {target} for extraction temp dir.",
+                    file=sys.stderr,
+                )
+            if extract_work_dir is not None:
+                extract_work_dir.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(
                 prefix="foundry_extract_",
-                dir=str(work_dir) if work_dir else None,
+                dir=str(extract_work_dir) if extract_work_dir else None,
             ) as extract_tmp:
                 extract_dir = Path(extract_tmp)
                 extract_archive(item, extract_dir)
@@ -1399,7 +1506,13 @@ def main() -> int:
                 telegram,
                 progress_enabled,
             )
-            moved = process_downloads(downloaded, modules_dir, args.force, work_dir)
+            moved = process_downloads(
+                downloaded,
+                modules_dir,
+                args.force,
+                work_dir,
+                explicit_work_dir,
+            )
             all_moved.extend(moved)
 
     if all_moved:

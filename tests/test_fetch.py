@@ -6,9 +6,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from foundry_module_fetch import (
+    EXTRACT_SAFETY_BYTES,
+    FALLBACK_EXPANSION_RATIO,
     TelegramConfig,
+    archive_uncompressed_size,
     ensure_not_html_download,
     estimate_download_size,
+    estimate_extract_bytes,
     extract_gdrive_file_id,
     filename_from_cd,
     is_dropbox,
@@ -21,6 +25,7 @@ from foundry_module_fetch import (
     parse_mega_link,
     parse_telegram_message_url,
     parse_yandex_public_url,
+    select_extract_dir,
 )
 
 
@@ -255,3 +260,153 @@ class TestEstimateDownloadSize:
 
         monkeypatch.setattr(fetch, "telegram_expected_size", lambda url, cfg: 123)
         assert estimate_download_size("https://t.me/c/1234567890/99") is None
+
+
+class _FakeCompleted:
+    def __init__(self, stdout: str = "", returncode: int = 0):
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+class TestArchiveUncompressedSize:
+    def test_sums_size_entries(self, monkeypatch, tmp_path):
+        listing = (
+            "Path = archive.7z\n"
+            "Type = 7z\n"
+            "Physical Size = 1000\n"
+            "----------\n"
+            "Path = a.txt\n"
+            "Size = 1500\n"
+            "Packed Size = 400\n"
+            "\n"
+            "Path = b.txt\n"
+            "Size = 2500\n"
+            "Packed Size = 800\n"
+        )
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *args, **kwargs: _FakeCompleted(stdout=listing, returncode=0),
+        )
+        archive = tmp_path / "x.7z"
+        archive.write_bytes(b"\x00")
+        assert archive_uncompressed_size(archive) == 4000
+
+    def test_returns_none_on_nonzero_returncode(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *args, **kwargs: _FakeCompleted(stdout="", returncode=2),
+        )
+        archive = tmp_path / "x.7z"
+        archive.write_bytes(b"\x00")
+        assert archive_uncompressed_size(archive) is None
+
+    def test_returns_none_when_no_size_entries(self, monkeypatch, tmp_path):
+        listing = "Path = archive.7z\nType = 7z\nPhysical Size = 100\n"
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *args, **kwargs: _FakeCompleted(stdout=listing, returncode=0),
+        )
+        archive = tmp_path / "x.7z"
+        archive.write_bytes(b"\x00")
+        assert archive_uncompressed_size(archive) is None
+
+    def test_returns_none_when_7z_missing(self, monkeypatch, tmp_path):
+        def boom(*args, **kwargs):
+            raise FileNotFoundError("7z not installed")
+
+        monkeypatch.setattr("subprocess.run", boom)
+        archive = tmp_path / "x.7z"
+        archive.write_bytes(b"\x00")
+        assert archive_uncompressed_size(archive) is None
+
+
+class TestEstimateExtractBytes:
+    def test_uses_uncompressed_size_when_available(self, monkeypatch, tmp_path):
+        archive = tmp_path / "x.7z"
+        archive.write_bytes(b"\x00" * 10)
+        monkeypatch.setattr(
+            "foundry_module_fetch.archive_uncompressed_size", lambda p: 5_000_000
+        )
+        assert estimate_extract_bytes(archive) == 5_000_000 + EXTRACT_SAFETY_BYTES
+
+    def test_falls_back_to_ratio_when_unknown(self, monkeypatch, tmp_path):
+        archive = tmp_path / "x.7z"
+        archive.write_bytes(b"\x00" * 1024)
+        monkeypatch.setattr(
+            "foundry_module_fetch.archive_uncompressed_size", lambda p: None
+        )
+        expected = 1024 * FALLBACK_EXPANSION_RATIO + EXTRACT_SAFETY_BYTES
+        assert estimate_extract_bytes(archive) == expected
+
+
+class TestSelectExtractDir:
+    def test_explicit_work_dir_is_returned(self, monkeypatch, tmp_path):
+        explicit = tmp_path / "explicit"
+        explicit.mkdir()
+        monkeypatch.setattr("foundry_module_fetch.free_bytes", lambda p: 10)
+        assert select_extract_dir(explicit, None, 9999) == explicit
+
+    def test_uses_default_tmp_when_enough_space(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "foundry_module_fetch.tempfile.gettempdir", lambda: str(tmp_path)
+        )
+        monkeypatch.setattr("foundry_module_fetch.free_bytes", lambda p: 10_000_000)
+        # Need < free, so default_tmp wins.
+        assert select_extract_dir(None, None, 5_000_000) is None
+
+    def test_switches_to_fallback_when_tmp_too_small(self, monkeypatch, tmp_path):
+        default_tmp = tmp_path / "smalltmp"
+        default_tmp.mkdir()
+        fallback = tmp_path / "fallback"
+        fallback.mkdir()
+        monkeypatch.setattr(
+            "foundry_module_fetch.tempfile.gettempdir", lambda: str(default_tmp)
+        )
+        monkeypatch.setattr(
+            "foundry_module_fetch.DEFAULT_FALLBACK_TMP_DIR", fallback
+        )
+
+        def fake_free(path: Path) -> int:
+            try:
+                resolved = Path(path).resolve()
+            except OSError:
+                resolved = Path(path)
+            if resolved == default_tmp.resolve():
+                return 100
+            if resolved == fallback.resolve():
+                return 10_000_000_000
+            return 0
+
+        monkeypatch.setattr("foundry_module_fetch.free_bytes", fake_free)
+        result = select_extract_dir(None, None, 1_000_000)
+        assert result is not None
+        assert Path(result).resolve() == fallback.resolve()
+
+    def test_returns_best_candidate_when_nothing_fits(self, monkeypatch, tmp_path):
+        default_tmp = tmp_path / "smalltmp"
+        default_tmp.mkdir()
+        fallback = tmp_path / "fallback"
+        fallback.mkdir()
+        monkeypatch.setattr(
+            "foundry_module_fetch.tempfile.gettempdir", lambda: str(default_tmp)
+        )
+        monkeypatch.setattr(
+            "foundry_module_fetch.DEFAULT_FALLBACK_TMP_DIR", fallback
+        )
+
+        def fake_free(path: Path) -> int:
+            try:
+                resolved = Path(path).resolve()
+            except OSError:
+                resolved = Path(path)
+            if resolved == default_tmp.resolve():
+                return 100
+            if resolved == fallback.resolve():
+                return 500
+            return 0
+
+        monkeypatch.setattr("foundry_module_fetch.free_bytes", fake_free)
+        result = select_extract_dir(None, None, 10_000_000)
+        # Neither fits, but fallback has more free space.
+        assert result is not None
+        assert Path(result).resolve() == fallback.resolve()
